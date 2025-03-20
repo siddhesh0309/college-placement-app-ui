@@ -1,0 +1,17 @@
+dr_rows = data.iloc[:-1].copy()
+    cr_row = data.iloc[-1:].copy()
+
+    # Remove Dr rows with blank Amount
+    dr_rows = dr_rows[dr_rows["Amount"].astype(str).str.strip() != ""]
+
+    # Convert Amount to number in Dr rows
+    dr_rows["Amount"] = pd.to_numeric(dr_rows["Amount"], errors='coerce')
+
+    # Calculate total of Dr rows
+    total_amount = dr_rows["Amount"].sum()
+
+    # Set total in CR row's Amount
+    cr_row.at[cr_row.index[0], "Amount"] = total_amount
+
+    # Combine final data
+    final_data = pd.concat([dr_rows, cr_row], ignore_index=True)

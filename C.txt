@@ -1,0 +1,148 @@
+import time
+import os
+import numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+# File paths (Update with actual paths)
+old_file_path = "last_year_data.xlsm"         # Last year's XLSM file
+new_file_path = "current_data.xlsx"           # New XLSX file to process
+output_file = "processed_file.xlsm"           # Processed file (normal save)
+missing_pan_output = "missing_pan_customers.xlsx"  # Customers with missing PAN
+template_file = "template.xlsm"               # Your macro-enabled template file
+final_output_file = "final_output_file.xlsm"  # Final output with data in template
+
+# Ensure Excel files are not open
+for file in [output_file, missing_pan_output, final_output_file]:
+    if os.path.exists(file):
+        try:
+            os.rename(file, file)  # Try renaming to check if it's open
+        except PermissionError:
+            print(f"❌ Error: Close '{file}' before running the script.")
+            exit()
+
+# Load both old and new files efficiently
+print("🔄 Loading Excel files...")
+df_old = pd.read_excel(old_file_path, sheet_name="Account Holder", engine="openpyxl", 
+                       usecols=["Customer ID", "Address", "City_Town", "Postal_Code", "State_Code", "Country_Code"])
+df_new = pd.read_excel(new_file_path, sheet_name="Account Holder", engine="openpyxl")
+
+print(f"✅ Files loaded successfully. New: {len(df_new)} rows, Old: {len(df_old)} rows.")
+
+# Start time tracking
+start_time = time.time()
+
+# Step 1: Merge new file with old file for address updates
+df_updated = df_new.merge(df_old, on=["Customer ID", "Address"], how="left", suffixes=("", "_old"))
+
+# Step 2: Efficiently update only the required columns
+for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]:
+    df_updated[col] = df_updated[col].combine_first(df_updated[col + "_old"])
+df_updated.drop(columns=[col + "_old" for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]], inplace=True)
+
+# Step 3: PAN Validation (Assign Dummy PAN)
+df_updated["PAN"] = df_updated["PAN"].fillna("")
+valid_dummy_pan_mask = (
+    (df_updated["PAN"] == "") & 
+    df_updated["Father's Name"].notna() & 
+    df_updated["Birth Date"].notna() & 
+    df_updated["Identification Number"].notna()
+)
+df_updated.loc[valid_dummy_pan_mask, "PAN"] = "AAAAA9999A"
+
+# Step 4: Extract missing PAN customers
+missing_pan_customers = df_updated[(df_updated["PAN"] == "") & ~valid_dummy_pan_mask]
+
+# Step 5: Define columns dynamically
+foreign_tin_columns = ["Foreign_TIN"] + [f"Foreign_TIN{i}" for i in range(2, 9)]
+tin_issuing_columns = ["TIN_Issuing_Country"] + [f"TIN_Issuing_Country{i}" for i in range(2, 9)]
+country_resident_columns = ["Country_of_Resident"] + [f"Country_of_Resident{i}" for i in range(2, 9)]
+
+# Ensure TIN Issuing Country matches Country of Resident
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    country_col = country_resident_columns[i]
+    if tin_col in df_updated.columns and country_col in df_updated.columns:
+        df_updated[tin_col] = df_updated[tin_col].combine_first(df_updated[country_col])
+
+# Assign "AAAAAAAAA" if Foreign_TIN is missing but TIN_Issuing_Country is present
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    foreign_tin_col = foreign_tin_columns[i]
+    if tin_col in df_updated.columns and foreign_tin_col in df_updated.columns:
+        condition = df_updated[tin_col].notna() & df_updated[foreign_tin_col].isna()
+        df_updated.loc[condition, foreign_tin_col] = "AAAAAAAAA"
+
+# Step 6: Remove Foreign_TIN and TIN_Issuing_Country for Account Treatment = "P" and SC = "N"
+mask_account_treatment = (df_updated["Account Treatment"] == "P") & (df_updated["SC"] == "N")
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    foreign_tin_col = foreign_tin_columns[i]
+    if tin_col in df_updated.columns and foreign_tin_col in df_updated.columns:
+        removal_condition = mask_account_treatment & (df_updated[foreign_tin_col] == "AAAAAAAAA")
+        df_updated.loc[removal_condition, [foreign_tin_col, tin_col]] = np.nan
+
+# Step 7: If Account Treatment = "P" and SC = "Y", check all Foreign_TIN columns for "AAAAAAAAA"
+mask_sc_y = (df_updated["Account Treatment"] == "P") & (df_updated["SC"] == "Y")
+sc_y_to_n_mask = mask_sc_y & df_updated[foreign_tin_columns].apply(lambda row: (row == "AAAAAAAAA").any(), axis=1)
+df_updated.loc[sc_y_to_n_mask, "SC"] = "N"
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    foreign_tin_col = foreign_tin_columns[i]
+    if tin_col in df_updated.columns and foreign_tin_col in df_updated.columns:
+        removal_condition = sc_y_to_n_mask & (df_updated[foreign_tin_col] == "AAAAAAAAA")
+        df_updated.loc[removal_condition, [foreign_tin_col, tin_col]] = np.nan
+
+# End time tracking
+end_time = time.time()
+processing_time = round(end_time - start_time, 2)
+print(f"✅ Data processing completed in {processing_time} seconds.")
+
+# Save 1: Processed data to processed_file.xlsm
+print(f"🔄 Saving processed data to '{output_file}'...")
+try:
+    with pd.ExcelWriter(output_file, engine="openpyxl", mode="w") as writer:
+        df_updated.to_excel(writer, sheet_name="Account Holder", index=False)
+    print(f"✅ Processed file saved as '{output_file}'.")
+except PermissionError:
+    print(f"❌ Error: '{output_file}' is open in another program. Close it and try again.")
+
+# Save 2: Write data into template.xlsm starting from row 9
+print(f"🔄 Writing data into template '{template_file}' starting from row 9...")
+try:
+    wb = load_workbook(template_file, keep_vba=True)
+except FileNotFoundError:
+    print(f"❌ Error: Template file '{template_file}' not found.")
+    exit()
+
+ws = wb["Account Holder"]
+
+# Clear data from row 9 onwards
+max_row = ws.max_row
+if max_row >= 9:
+    ws.delete_rows(9, max_row - 8)
+
+# Write processed data from row 9
+for r_idx, row in enumerate(dataframe_to_rows(df_updated, index=False, header=False), start=9):
+    for c_idx, value in enumerate(row, start=1):
+        ws.cell(row=r_idx, column=c_idx, value=value)
+
+# Save as final output file preserving macros
+try:
+    wb.save(final_output_file)
+    print(f"✅ Final output saved as '{final_output_file}' with data starting from row 9.")
+except PermissionError:
+    print(f"❌ Error: '{final_output_file}' is open. Close it and try again.")
+
+# Save missing PAN customers
+if not missing_pan_customers.empty:
+    print(f"🔄 Saving missing PAN customers to '{missing_pan_output}'...")
+    try:
+        with pd.ExcelWriter(missing_pan_output, engine="openpyxl", mode="w") as writer:
+            missing_pan_customers.to_excel(writer, index=False)
+        print(f"✅ Missing PAN customers saved in '{missing_pan_output}'.")
+    except PermissionError:
+        print(f"❌ Error: '{missing_pan_output}' is open in another program. Close it and try again.")
+
+print("🎯 Process completed successfully!")

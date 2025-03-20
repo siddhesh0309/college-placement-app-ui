@@ -1,0 +1,176 @@
+import time
+import os
+import numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+
+# File paths
+template_file = "template.xlsm"  # Write directly into this template
+missing_pan_output = "missing_pan_customers.xlsx"  # Customers with missing PAN
+
+# Define cell highlight fills
+fill_dummy_pan = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")       # Yellow
+fill_tin_added = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")       # Light Blue
+fill_tin_cleared = PatternFill(start_color="FFB6C1", end_color="FFB6C1", fill_type="solid")     # Light Red
+
+# Ensure Excel files are not open
+for file in [template_file, missing_pan_output]:
+    if os.path.exists(file):
+        try:
+            os.rename(file, file)
+        except PermissionError:
+            print(f"❌ Error: Close '{file}' before running the script.")
+            exit()
+
+# Load old and new Excel files
+print("🔄 Loading Excel files...")
+df_old = pd.read_excel("last_year_data.xlsm", sheet_name="Account Holder", engine="openpyxl",
+                       usecols=["Customer ID", "Address", "City_Town", "Postal_Code", "State_Code", "Country_Code"])
+df_new = pd.read_excel("current_data.xlsx", sheet_name="Account Holder", engine="openpyxl")
+
+print(f"✅ Files loaded. New: {len(df_new)} rows, Old: {len(df_old)} rows.")
+
+start_time = time.time()
+
+# Merge for address updates
+df_updated = df_new.merge(df_old, on=["Customer ID", "Address"], how="left", suffixes=("", "_old"))
+
+for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]:
+    df_updated[col] = df_updated[col].combine_first(df_updated[col + "_old"])
+df_updated.drop(columns=[col + "_old" for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]], inplace=True)
+
+# Highlight tracking sets
+pan_highlight_cells = set()
+tin_added_cells = set()
+tin_cleared_cells = set()
+
+# PAN Validation (Assign Dummy PAN)
+df_updated["PAN"] = df_updated["PAN"].fillna("")
+valid_dummy_pan_mask = (
+    (df_updated["PAN"] == "") &
+    df_updated["Father's Name"].notna() &
+    df_updated["Birth Date"].notna() &
+    df_updated["Identification Number"].notna()
+)
+
+# Track cells for dummy PAN
+for idx in df_updated[valid_dummy_pan_mask].index:
+    pan_highlight_cells.add((idx, "PAN"))
+
+df_updated.loc[valid_dummy_pan_mask, "PAN"] = "AAAAA9999A"
+
+# Drop first 4 rows (headers mistakenly read as data)
+df_updated = df_updated.iloc[4:].reset_index(drop=True)
+
+# Extract missing PAN customers
+missing_pan_customers = df_updated[(df_updated["PAN"] == "") & ~valid_dummy_pan_mask]
+
+# Define columns
+foreign_tin_columns = ["Foreign_TIN"] + [f"Foreign_TIN{i}" for i in range(2, 9)]
+tin_issuing_columns = ["TIN_Issuing_Country"] + [f"TIN_Issuing_Country{i}" for i in range(2, 9)]
+country_resident_columns = ["Country_of_Resident"] + [f"Country_of_Resident{i}" for i in range(2, 9)]
+
+# Ensure TIN Issuing Country matches Country of Resident
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    country_col = country_resident_columns[i]
+    if tin_col in df_updated.columns and country_col in df_updated.columns:
+        df_updated[tin_col] = df_updated[tin_col].combine_first(df_updated[country_col])
+
+# Assign "AAAAAAAAA" where needed and track
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    foreign_tin_col = foreign_tin_columns[i]
+    if tin_col in df_updated.columns and foreign_tin_col in df_updated.columns:
+        condition = df_updated[tin_col].notna() & df_updated[foreign_tin_col].isna()
+
+        for idx in df_updated[condition].index:
+            tin_added_cells.add((idx, foreign_tin_col))
+
+        df_updated.loc[condition, foreign_tin_col] = "AAAAAAAAA"
+
+# Handle Account Treatment = "P" and SC = "N"
+mask_account_treatment = (df_updated["Account Treatment"] == "P") & (df_updated["SC"] == "N")
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    foreign_tin_col = foreign_tin_columns[i]
+    if tin_col in df_updated.columns and foreign_tin_col in df_updated.columns:
+        removal_condition = mask_account_treatment & (df_updated[foreign_tin_col] == "AAAAAAAAA")
+
+        for idx in df_updated[removal_condition].index:
+            tin_cleared_cells.add((idx, foreign_tin_col))
+            tin_cleared_cells.add((idx, tin_col))
+
+        df_updated.loc[removal_condition, [foreign_tin_col, tin_col]] = np.nan
+
+# Handle Account Treatment = "P" and SC = "Y"
+mask_sc_y = (df_updated["Account Treatment"] == "P") & (df_updated["SC"] == "Y")
+existing_foreign_tin_cols = [col for col in foreign_tin_columns if col in df_updated.columns]
+if existing_foreign_tin_cols:
+    sc_y_to_n_mask = mask_sc_y & df_updated[existing_foreign_tin_cols].apply(lambda row: (row == "AAAAAAAAA").any(), axis=1)
+else:
+    sc_y_to_n_mask = pd.Series([False] * len(df_updated), index=df_updated.index)
+
+df_updated.loc[sc_y_to_n_mask, "SC"] = "N"
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    foreign_tin_col = foreign_tin_columns[i]
+    if tin_col in df_updated.columns and foreign_tin_col in df_updated.columns:
+        removal_condition = sc_y_to_n_mask & (df_updated[foreign_tin_col] == "AAAAAAAAA")
+
+        for idx in df_updated[removal_condition].index:
+            tin_cleared_cells.add((idx, foreign_tin_col))
+            tin_cleared_cells.add((idx, tin_col))
+
+        df_updated.loc[removal_condition, [foreign_tin_col, tin_col]] = np.nan
+
+processing_time = round(time.time() - start_time, 2)
+print(f"✅ Data processed in {processing_time} seconds.")
+
+# Write data into template from row 9 (no headers), with cell highlights
+print(f"🔄 Writing data into '{template_file}' from row 9 (no headers, with highlights)...")
+try:
+    workbook = load_workbook(template_file, keep_vba=True)
+    sheet = workbook["Account Holder"]
+
+    # Clear row 9
+    for cell in sheet[9]:
+        cell.value = None
+
+    # Clear rows 10 onward
+    for row in sheet.iter_rows(min_row=10, max_row=sheet.max_row):
+        for cell in row:
+            cell.value = None
+
+    # Write data with color highlights
+    for df_idx, row in enumerate(df_updated.itertuples(index=False), start=9):
+        for col_idx, (col_name, value) in enumerate(zip(df_updated.columns, row), start=1):
+            cell = sheet.cell(row=df_idx, column=col_idx, value=value)
+
+            # Apply highlights
+            if (df_idx - 9, col_name) in pan_highlight_cells:
+                cell.fill = fill_dummy_pan
+            elif (df_idx - 9, col_name) in tin_added_cells:
+                cell.fill = fill_tin_added
+            elif (df_idx - 9, col_name) in tin_cleared_cells:
+                cell.fill = fill_tin_cleared
+
+    workbook.save(template_file)
+    print(f"✅ Data written to '{template_file}' from row 9 with highlights.")
+except PermissionError:
+    print(f"❌ Error: '{template_file}' is open. Close it and try again.")
+except Exception as e:
+    print(f"❌ Unexpected error while saving: {e}")
+
+# Save missing PAN customers
+if not missing_pan_customers.empty:
+    print(f"🔄 Saving missing PAN customers to '{missing_pan_output}'...")
+    try:
+        with pd.ExcelWriter(missing_pan_output, engine="openpyxl", mode="w") as writer:
+            missing_pan_customers.to_excel(writer, index=False)
+        print(f"✅ Missing PAN customers saved in '{missing_pan_output}'.")
+    except PermissionError:
+        print(f"❌ Error: '{missing_pan_output}' is open. Close it and try again.")
+
+print("🎯 Process completed successfully!")

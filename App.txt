@@ -1,0 +1,33 @@
+# Save rows where PAN is still blank (after processing)
+blank_pan_customers = df_updated[df_updated["PAN"] == ""]
+
+
+# Gather all TIN values across Foreign_TIN columns
+foreign_tin_cols_existing = [col for col in foreign_tin_columns if col in df_updated.columns]
+
+# Stack TIN values with Customer ID for duplicate detection
+tin_long = df_updated[["Customer ID"] + foreign_tin_cols_existing].melt(id_vars="Customer ID", value_vars=foreign_tin_cols_existing, var_name="TIN_Column", value_name="TIN_Value")
+
+# Drop blanks and find duplicates
+tin_long = tin_long[tin_long["TIN_Value"].notna() & (tin_long["TIN_Value"] != "")]
+duplicate_tins = tin_long["TIN_Value"][tin_long["TIN_Value"].duplicated(keep=False)]
+
+# Filter rows with duplicate TINs
+duplicate_tin_customers = df_updated[df_updated[foreign_tin_cols_existing].apply(lambda row: any(tin in duplicate_tins.values for tin in row if pd.notna(tin)), axis=1)]
+
+
+# Save blank PAN customers
+if not blank_pan_customers.empty:
+    blank_pan_file = "blank_pan_customers.xlsx"
+    print(f"🔄 Saving blank PAN customers to '{blank_pan_file}'...")
+    with pd.ExcelWriter(blank_pan_file, engine="openpyxl", mode="w") as writer:
+        blank_pan_customers.to_excel(writer, index=False)
+    print(f"✅ Blank PAN customers saved.")
+
+# Save duplicate TIN customers
+if not duplicate_tin_customers.empty:
+    duplicate_tin_file = "duplicate_tin_customers.xlsx"
+    print(f"🔄 Saving duplicate TIN customers to '{duplicate_tin_file}'...")
+    with pd.ExcelWriter(duplicate_tin_file, engine="openpyxl", mode="w") as writer:
+        duplicate_tin_customers.to_excel(writer, index=False)
+    print(f"✅ Duplicate TIN customers saved.")

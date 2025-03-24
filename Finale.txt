@@ -1,0 +1,172 @@
+import time
+import os
+import numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+
+# File paths
+template_file = "template.xlsm"
+missing_pan_output = "missing_pan_customers.xlsx"
+blank_pan_output = "blank_pan_customers.xlsx"
+duplicate_tin_output = "duplicate_tin_customers.xlsx"
+
+# Define cell highlight colors
+fill_dummy_pan = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")       # Orange
+fill_tin_added = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")       # Light Blue
+fill_tin_cleared = PatternFill(start_color="FFB6C1", end_color="FFB6C1", fill_type="solid")     # Light Red
+fill_state_code_updated = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")  # Green
+
+# Ensure files are not open
+for file in [template_file, missing_pan_output, blank_pan_output, duplicate_tin_output]:
+    if os.path.exists(file):
+        try:
+            os.rename(file, file)
+        except PermissionError:
+            print(f"❌ Error: Close '{file}' before running the script.")
+            exit()
+
+# Load files
+print("🔄 Loading Excel files...")
+df_old = pd.read_excel(
+    "last_year_data.xlsm",
+    sheet_name="Account Holder",
+    engine="openpyxl",
+    dtype={"Postal_Code": str},  # Preserve spaces
+    usecols=["Customer ID", "Address", "Account Number", "City_Town", "Postal_Code", "State_Code", "Country_Code"]
+)
+df_new = pd.read_excel("current_data.xlsx", sheet_name="Account Holder", engine="openpyxl")
+print(f"✅ Files loaded. New: {len(df_new)} rows, Old: {len(df_old)} rows.")
+start_time = time.time()
+
+# Merge on Customer ID, Address, Account Number
+merge_keys = ["Customer ID", "Address", "Account Number"]
+df_updated = df_new.merge(df_old, on=merge_keys, how="left", suffixes=("", "_old"))
+
+# Track changes for highlights
+pan_highlight_cells = set()
+tin_added_cells = set()
+tin_cleared_cells = set()
+state_code_highlight_cells = set()
+
+# Update State_Code where old exists
+mask_state = df_updated["State_Code_old"].notna()
+for idx in df_updated[mask_state].index:
+    state_code_highlight_cells.add((idx, "State_Code"))
+df_updated.loc[mask_state, "State_Code"] = df_updated.loc[mask_state, "State_Code_old"]
+
+# Update City_Town, Postal_Code, Country_Code only if new value is missing
+for col in ["City_Town", "Postal_Code", "Country_Code"]:
+    df_updated[col] = df_updated[col].combine_first(df_updated[col + "_old"])
+df_updated.drop(columns=[col + "_old" for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]], inplace=True)
+
+# Dummy PAN assignment: blank or PANNOTAVAL
+df_updated["PAN"] = df_updated["PAN"].fillna("").str.strip().str.upper()
+valid_dummy_mask = (
+    ((df_updated["PAN"] == "") | (df_updated["PAN"] == "PANNOTAVAL")) &
+    df_updated["Father's Name"].notna() &
+    df_updated["Birth Date"].notna() &
+    df_updated["Identification Number"].notna()
+)
+for idx in df_updated[valid_dummy_mask].index:
+    pan_highlight_cells.add((idx, "PAN"))
+df_updated.loc[valid_dummy_mask, "PAN"] = "AAAAA9999A"
+
+# Drop first 4 rows (headers as data)
+df_updated = df_updated.iloc[4:].reset_index(drop=True)
+
+# Preserve Postal_Code as string with spaces
+df_updated["Postal_Code"] = df_updated["Postal_Code"].astype(str)
+
+# Missing PAN (not eligible for dummy)
+missing_pan_customers = df_updated[(df_updated["PAN"] == "") & ~valid_dummy_mask]
+# Blank PAN (after all processing)
+blank_pan_customers = df_updated[df_updated["PAN"] == ""]
+
+# TIN Columns
+foreign_tin_cols = ["Foreign_TIN"] + [f"Foreign_TIN{i}" for i in range(2, 9)]
+tin_issuing_cols = ["TIN_Issuing_Country"] + [f"TIN_Issuing_Country{i}" for i in range(2, 9)]
+country_res_cols = ["Country_of_Resident"] + [f"Country_of_Resident{i}" for i in range(2, 9)]
+
+# Fill TIN_Issuing_Country from Country_of_Resident
+for i in range(8):
+    if tin_issuing_cols[i] in df_updated.columns and country_res_cols[i] in df_updated.columns:
+        df_updated[tin_issuing_cols[i]] = df_updated[tin_issuing_cols[i]].combine_first(df_updated[country_res_cols[i]])
+
+# Assign AAAAAAAAA where TIN_Issuing exists but Foreign_TIN missing
+for i in range(8):
+    tin_col = tin_issuing_cols[i]
+    foreign_col = foreign_tin_cols[i]
+    if tin_col in df_updated.columns and foreign_col in df_updated.columns:
+        cond = df_updated[tin_col].notna() & df_updated[foreign_col].isna()
+        for idx in df_updated[cond].index:
+            tin_added_cells.add((idx, foreign_col))
+        df_updated.loc[cond, foreign_col] = "AAAAAAAAA"
+
+# Clear AAAAAAAAA for P, SC=N
+mask_p_sc_n = (df_updated["Account Treatment"] == "P") & (df_updated["SC"] == "N")
+for i in range(8):
+    tin_col = tin_issuing_cols[i]
+    foreign_col = foreign_tin_cols[i]
+    if tin_col in df_updated.columns and foreign_col in df_updated.columns:
+        cond = mask_p_sc_n & (df_updated[foreign_col] == "AAAAAAAAA")
+        for idx in df_updated[cond].index:
+            tin_cleared_cells.add((idx, foreign_col))
+            tin_cleared_cells.add((idx, tin_col))
+        df_updated.loc[cond, [foreign_col, tin_col]] = np.nan
+
+# SC=Y to SC=N if any AAAAAAAAA
+mask_p_sc_y = (df_updated["Account Treatment"] == "P") & (df_updated["SC"] == "Y")
+existing_tins = [col for col in foreign_tin_cols if col in df_updated.columns]
+if existing_tins:
+    sc_y_to_n = mask_p_sc_y & df_updated[existing_tins].apply(lambda r: (r == "AAAAAAAAA").any(), axis=1)
+    df_updated.loc[sc_y_to_n, "SC"] = "N"
+    for i in range(8):
+        tin_col = tin_issuing_cols[i]
+        foreign_col = foreign_tin_cols[i]
+        if tin_col in df_updated.columns and foreign_col in df_updated.columns:
+            cond = sc_y_to_n & (df_updated[foreign_col] == "AAAAAAAAA")
+            for idx in df_updated[cond].index:
+                tin_cleared_cells.add((idx, foreign_col))
+                tin_cleared_cells.add((idx, tin_col))
+            df_updated.loc[cond, [foreign_col, tin_col]] = np.nan
+
+# Duplicate TIN detection
+tin_long = df_updated[["Customer ID"] + existing_tins].melt(id_vars="Customer ID", value_vars=existing_tins, var_name="TIN_Column", value_name="TIN_Value")
+tin_long = tin_long[tin_long["TIN_Value"].notna() & (tin_long["TIN_Value"] != "")]
+dup_tins = tin_long["TIN_Value"][tin_long["TIN_Value"].duplicated(keep=False)]
+dup_customers = df_updated[df_updated[existing_tins].apply(lambda r: any(t in dup_tins.values for t in r if pd.notna(t)), axis=1)]
+
+# Write processed data to template.xlsm from row 9 (no headers), with highlights
+print(f"🔄 Writing data to '{template_file}' from row 9...")
+wb = load_workbook(template_file, keep_vba=True)
+ws = wb["Account Holder"]
+for cell in ws[9]: cell.value = None
+for row in ws.iter_rows(min_row=10, max_row=ws.max_row):
+    for cell in row: cell.value = None
+for df_idx, row in enumerate(df_updated.itertuples(index=False), start=9):
+    for col_idx, (col_name, value) in enumerate(zip(df_updated.columns, row), start=1):
+        cell = ws.cell(row=df_idx, column=col_idx, value=value)
+        if (df_idx - 9, col_name) in pan_highlight_cells:
+            cell.fill = fill_dummy_pan
+        elif (df_idx - 9, col_name) in tin_added_cells:
+            cell.fill = fill_tin_added
+        elif (df_idx - 9, col_name) in tin_cleared_cells:
+            cell.fill = fill_tin_cleared
+        elif (df_idx - 9, col_name) in state_code_highlight_cells:
+            cell.fill = fill_state_code_updated
+wb.save(template_file)
+print(f"✅ Data written to '{template_file}' with highlights.")
+
+# Save DataFrames
+def save_df(df, file, desc):
+    if not df.empty:
+        print(f"🔄 Saving {desc} to '{file}'...")
+        with pd.ExcelWriter(file, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+        print(f"✅ {desc} saved.")
+
+save_df(missing_pan_customers, missing_pan_output, "missing PAN customers")
+save_df(blank_pan_customers, blank_pan_output, "blank PAN customers")
+save_df(dup_customers, duplicate_tin_output, "duplicate TIN customers")
+print("🎯 Process completed successfully!")

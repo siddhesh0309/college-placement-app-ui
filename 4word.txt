@@ -1,0 +1,82 @@
+import time
+import pandas as pd
+
+start_time = time.time()
+state_code_cleared = set()
+
+# Step 0: Clean and standardize key columns
+for col in ["Customer ID", "Address", "Account_Number"]:
+    df_new[col] = df_new[col].astype(str).str.strip().str.upper()
+    df_old[col] = df_old[col].astype(str).str.strip().str.upper()
+
+# Step 1: Exact match merge on Customer ID, Address, and Account Number
+df_updated = df_new.merge(
+    df_old,
+    on=["Customer ID", "Address", "Account_Number"],
+    how="left",
+    suffixes=("", "_old")
+)
+
+# Step 1.1: Track and update State_Code if matched
+mask_matched_state = df_updated["State_Code_old"].notna()
+for idx in df_updated[mask_matched_state].index:
+    state_code_cleared.add((idx, "State_Code"))
+
+df_updated.loc[mask_matched_state, "State_Code"] = df_updated.loc[mask_matched_state, "State_Code_old"]
+
+print("After exact merge:", df_updated.shape)
+
+# Step 2: Fill missing values using *_old
+for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]:
+    df_updated[col] = df_updated[col].combine_first(df_updated[col + "_old"])
+
+# Drop *_old columns
+df_updated.drop(
+    columns=[col + "_old" for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]],
+    inplace=True
+)
+
+# Step 3: Fuzzy address match (only where Customer ID & Account Number match, but Address does not)
+
+def get_first_4_words(addr):
+    return ' '.join(addr.split()[:4])
+
+# Add helper column to df_old
+df_old["Address_First4"] = df_old["Address"].apply(get_first_4_words)
+
+# Get unmatched rows from df_new based on Customer ID + Account Number where address didn’t match
+merged_check = df_new.merge(
+    df_old,
+    on=["Customer ID", "Account_Number"],
+    how="left",
+    suffixes=("", "_old")
+)
+
+# Filter rows where Address did NOT match and location fields are still missing in df_updated
+merged_check["Address_First4"] = merged_check["Address"].apply(get_first_4_words)
+df_old["Address_First4"] = df_old["Address"].apply(get_first_4_words)
+
+df_candidates = merged_check[
+    (merged_check["Address"] != merged_check["Address_old"]) &
+    (
+        df_updated[["City_Town", "Postal_Code", "State_Code", "Country_Code"]]
+        .isna().any(axis=1)
+    )
+].copy()
+
+# Fuzzy match: first 4 words of address + Customer ID + Account Number
+df_partial_match = df_candidates.merge(
+    df_old[["Customer ID", "Account_Number", "Address_First4", "City_Town", "Postal_Code", "State_Code", "Country_Code"]],
+    on=["Customer ID", "Account_Number", "Address_First4"],
+    how="left"
+)
+
+# Apply updates only where df_updated still has missing values
+for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]:
+    df_updated.loc[df_candidates.index, col] = df_updated.loc[df_candidates.index, col].combine_first(df_partial_match[col])
+
+# Cleanup
+df_old.drop(columns=["Address_First4"], inplace=True)
+
+print("Final shape:", df_updated.shape)
+print("Total time:", time.time() - start_time)

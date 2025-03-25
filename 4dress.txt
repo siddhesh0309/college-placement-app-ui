@@ -1,0 +1,176 @@
+import time
+import os
+import numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+
+# File paths
+template_file = "template.xlsm"
+missing_pan_output = "missing_pan_customers.xlsx"
+
+# Ensure Excel files are not open
+for file in [template_file, missing_pan_output]:
+    if os.path.exists(file):
+        try:
+            os.rename(file, file)
+        except PermissionError:
+            print(f"❌ Error: Close '{file}' before running the script.")
+            exit()
+
+# Load old and new Excel files
+print("🔄 Loading Excel files...")
+df_old = pd.read_excel("last_year_data.xlsm", sheet_name="Account Holder", engine="openpyxl",
+                       usecols=["Customer ID", "Account Number", "Address", "City_Town", "Postal_Code", "State_Code", "Country_Code"])
+df_new = pd.read_excel("current_data.xlsx", sheet_name="Account Holder", engine="openpyxl")
+
+print(f"✅ Files loaded. New: {len(df_new)} rows, Old: {len(df_old)} rows.")
+
+start_time = time.time()
+
+# Merge for address updates (exact match on Customer ID + Address)
+df_updated = df_new.merge(df_old, on=["Customer ID", "Address"], how="left", suffixes=("", "_old"))
+
+for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]:
+    df_updated[col] = df_updated[col].combine_first(df_updated[col + "_old"])
+df_updated.drop(columns=[col + "_old" for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]], inplace=True)
+
+# Step 1: Fuzzy match based on first 4 words
+df_updated["Address_first4"] = df_updated["Address"].astype(str).str.lower().str.replace(r'\s+', ' ', regex=True).str.strip().str.split().apply(lambda x: ' '.join(x[:4]))
+df_old["Address_first4"] = df_old["Address"].astype(str).str.lower().str.replace(r'\s+', ' ', regex=True).str.strip().str.split().apply(lambda x: ' '.join(x[:4]))
+
+df_updated["fuzzy_key_4start"] = df_updated["Customer ID"].astype(str) + "_" + df_updated["Account Number"].astype(str) + "_" + df_updated["Address_first4"]
+df_old["fuzzy_key_4start"] = df_old["Customer ID"].astype(str) + "_" + df_old["Account Number"].astype(str) + "_" + df_old["Address_first4"]
+
+df_fuzzy_lookup_4start = df_old[["fuzzy_key_4start", "City_Town", "Postal_Code", "State_Code", "Country_Code"]]
+
+print("⚡ Performing fuzzy address match (first 4 words)...")
+missing_mask_1 = df_updated["City_Town"].isna()
+df_updated_fuzzy1 = df_updated[missing_mask_1].merge(df_fuzzy_lookup_4start, on="fuzzy_key_4start", how="left", suffixes=("", "_fuzzy"))
+
+for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]:
+    df_updated.loc[missing_mask_1, col] = df_updated_fuzzy1[col + "_fuzzy"].values
+
+# Step 2: Fallback fuzzy match based on last 4 words
+df_updated["Address_last4"] = df_updated["Address"].astype(str).str.lower().str.replace(r'\s+', ' ', regex=True).str.strip().str.split().apply(lambda x: ' '.join(x[-4:]))
+df_old["Address_last4"] = df_old["Address"].astype(str).str.lower().str.replace(r'\s+', ' ', regex=True).str.strip().str.split().apply(lambda x: ' '.join(x[-4:]))
+
+df_updated["fuzzy_key_4end"] = df_updated["Customer ID"].astype(str) + "_" + df_updated["Account Number"].astype(str) + "_" + df_updated["Address_last4"]
+df_old["fuzzy_key_4end"] = df_old["Customer ID"].astype(str) + "_" + df_old["Account Number"].astype(str) + "_" + df_old["Address_last4"]
+
+df_fuzzy_lookup_4end = df_old[["fuzzy_key_4end", "City_Town", "Postal_Code", "State_Code", "Country_Code"]]
+
+print("⚡ Performing fallback fuzzy match (last 4 words)...")
+missing_mask_2 = df_updated["City_Town"].isna()
+df_updated_fuzzy2 = df_updated[missing_mask_2].merge(df_fuzzy_lookup_4end, on="fuzzy_key_4end", how="left", suffixes=("", "_fuzzy"))
+
+for col in ["City_Town", "Postal_Code", "State_Code", "Country_Code"]:
+    df_updated.loc[missing_mask_2, col] = df_updated_fuzzy2[col + "_fuzzy"].values
+
+# Cleanup
+df_updated.drop(columns=["Address_first4", "Address_last4", "fuzzy_key_4start", "fuzzy_key_4end"], inplace=True, errors="ignore")
+df_old.drop(columns=["Address_first4", "Address_last4", "fuzzy_key_4start", "fuzzy_key_4end"], inplace=True, errors="ignore")
+
+print("✅ Optimized fuzzy matching complete (first 4 words + last 4 words).")
+
+# PAN Validation (Assign Dummy PAN)
+df_updated["PAN"] = df_updated["PAN"].fillna("")
+valid_dummy_pan_mask = (
+    (df_updated["PAN"] == "") &
+    df_updated["Father's Name"].notna() &
+    df_updated["Birth Date"].notna() &
+    df_updated["Identification Number"].notna()
+)
+df_updated.loc[valid_dummy_pan_mask, "PAN"] = "AAAAA9999A"
+
+# Drop first 4 rows if needed
+df_updated = df_updated.iloc[4:].reset_index(drop=True)
+
+# Extract missing PAN customers
+missing_pan_customers = df_updated[(df_updated["PAN"] == "") & ~valid_dummy_pan_mask]
+
+# Define TIN and residency columns
+foreign_tin_columns = ["Foreign_TIN"] + [f"Foreign_TIN{i}" for i in range(2, 9)]
+tin_issuing_columns = ["TIN_Issuing_Country"] + [f"TIN_Issuing_Country{i}" for i in range(2, 9)]
+country_resident_columns = ["Country_of_Resident"] + [f"Country_of_Resident{i}" for i in range(2, 9)]
+
+# Ensure TIN Issuing Country matches Country of Resident
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    country_col = country_resident_columns[i]
+    if tin_col in df_updated.columns and country_col in df_updated.columns:
+        df_updated[tin_col] = df_updated[tin_col].combine_first(df_updated[country_col])
+
+# Assign "AAAAAAAAA" where TIN Issuing Country is present but Foreign TIN is missing
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    foreign_tin_col = foreign_tin_columns[i]
+    if tin_col in df_updated.columns and foreign_tin_col in df_updated.columns:
+        condition = df_updated[tin_col].notna() & df_updated[foreign_tin_col].isna()
+        df_updated.loc[condition, foreign_tin_col] = "AAAAAAAAA"
+
+# Account Treatment = P and SC = N → remove "AAAAAAAAA" entries
+mask_account_treatment = (df_updated["Account Treatment"] == "P") & (df_updated["SC"] == "N")
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    foreign_tin_col = foreign_tin_columns[i]
+    if tin_col in df_updated.columns and foreign_tin_col in df_updated.columns:
+        removal_condition = mask_account_treatment & (df_updated[foreign_tin_col] == "AAAAAAAAA")
+        df_updated.loc[removal_condition, [foreign_tin_col, tin_col]] = np.nan
+
+# Account Treatment = P and SC = Y → check if any AAAAAAAAA, then convert SC to N and remove those values
+mask_sc_y = (df_updated["Account Treatment"] == "P") & (df_updated["SC"] == "Y")
+existing_foreign_tin_cols = [col for col in foreign_tin_columns if col in df_updated.columns]
+if existing_foreign_tin_cols:
+    sc_y_to_n_mask = mask_sc_y & df_updated[existing_foreign_tin_cols].apply(lambda row: (row == "AAAAAAAAA").any(), axis=1)
+else:
+    sc_y_to_n_mask = pd.Series([False] * len(df_updated), index=df_updated.index)
+
+df_updated.loc[sc_y_to_n_mask, "SC"] = "N"
+for i in range(8):
+    tin_col = tin_issuing_columns[i]
+    foreign_tin_col = foreign_tin_columns[i]
+    if tin_col in df_updated.columns and foreign_tin_col in df_updated.columns:
+        removal_condition = sc_y_to_n_mask & (df_updated[foreign_tin_col] == "AAAAAAAAA")
+        df_updated.loc[removal_condition, [foreign_tin_col, tin_col]] = np.nan
+
+processing_time = round(time.time() - start_time, 2)
+print(f"✅ Data processed in {processing_time} seconds.")
+
+# Write to template from row 9
+print(f"🔄 Writing data into '{template_file}' starting from row 9 (no headers)...")
+try:
+    workbook = load_workbook(template_file, keep_vba=True)
+    sheet = workbook["Account Holder"]
+
+    # Clear row 9
+    for cell in sheet[9]:
+        cell.value = None
+
+    # Clear rows 10 onwards
+    for row in sheet.iter_rows(min_row=10, max_row=sheet.max_row):
+        for cell in row:
+            cell.value = None
+
+    # Write data from row 9 onward (no headers)
+    for row_idx, row in enumerate(df_updated.itertuples(index=False), start=9):
+        for col_idx, value in enumerate(row, start=1):
+            sheet.cell(row=row_idx, column=col_idx, value=value)
+
+    workbook.save(template_file)
+    print(f"✅ Data written to '{template_file}' from row 9 (no headers).")
+except PermissionError:
+    print(f"❌ Error: '{template_file}' is open. Close it and try again.")
+except Exception as e:
+    print(f"❌ Unexpected error while saving: {e}")
+
+# Save missing PAN customers
+if not missing_pan_customers.empty:
+    print(f"🔄 Saving missing PAN customers to '{missing_pan_output}'...")
+    try:
+        with pd.ExcelWriter(missing_pan_output, engine="openpyxl", mode="w") as writer:
+            missing_pan_customers.to_excel(writer, index=False)
+        print(f"✅ Missing PAN customers saved in '{missing_pan_output}'.")
+    except PermissionError:
+        print(f"❌ Error: '{missing_pan_output}' is open. Close it and try again.")
+
+print("🎯 Process completed successfully!")

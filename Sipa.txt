@@ -1,0 +1,94 @@
+openapi: 3.0.3
+info:
+  title: EPAN Validate PAN API
+  version: 1.0.0
+  description: API to validate PAN details.
+
+servers:
+  - url: http://ServerIP:Port
+
+paths:
+  /ePAN/panEnquiryV3:
+    post:
+      summary: Validate PAN details
+      operationId: panEnquiry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                panNo:
+                  type: string
+                  example: "ABCDE1234F"
+                name:
+                  type: string
+                  example: "John Doe"
+                fatherName:
+                  type: string
+                  example: "Robert Doe"
+                dob:
+                  type: string
+                  format: date
+                  example: "01-01-1990"
+                appId:
+                  type: string
+                  example: "app123"
+                pw:
+                  type: string
+                  example: "password123"
+              required:
+                - panNo
+                - name
+                - fatherName
+                - dob
+                - appId
+                - pw
+      responses:
+        '200':
+          description: Successful PAN validation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  NGPanDetail:
+                    type: object
+                    properties:
+                      outputData:
+                        type: object
+                        properties:
+                          fathername:
+                            type: string
+                          dob:
+                            type: string
+                          name:
+                            type: string
+                          pan_status:
+                            type: string
+                            example: "N"
+                          pan:
+                            type: string
+                            example: "AHAPA1555H"
+                          seeding_status:
+                            type: string
+                      status:
+                        type: string
+                        example: "S0"
+        '400':
+          description: Missing or invalid input
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  NGPanDetail:
+                    type: object
+                    properties:
+                      errorMessage:
+                        type: string
+                        example: "name is mandatory!"
+                      status:
+                        type: string
+                        example: "P04"

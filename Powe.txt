@@ -1,0 +1,1 @@
+formatDateTime(concat(substring(items('Unique_2')?['BUSYDT'], 4, 4), '-', substring(items('Unique_2')?['BUSYDT'], 2, 2), '-', substring(items('Unique_2')?['BUSYDT'], 0, 2)), 'yyyy-MM')

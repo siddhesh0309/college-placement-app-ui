@@ -1,0 +1,103 @@
+import pandas as pd
+from pathlib import Path
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+# Load input files
+vfin_df = pd.read_excel("Vfin.xlsx")
+buyfp_df = pd.read_excel("buyfp.xlsx")
+config_df = pd.read_excel("customer_config.xlsx")
+
+# Convert date columns
+vfin_df['Date'] = pd.to_datetime(vfin_df['Date'])
+buyfp_df['Date'] = pd.to_datetime(buyfp_df['Date'])
+
+# Output directory
+output_dir = Path("Customer_Excels")
+output_dir.mkdir(exist_ok=True)
+
+# Get unique customers
+customers = buyfp_df['Customer Name'].dropna().unique()
+
+# Process each customer
+for customer in customers:
+    config = config_df[config_df['Customer Name'] == customer]
+    if config.empty:
+        print(f"Skipping {customer}: No config data found.")
+        continue
+
+    config = config.iloc[0]
+    tbill = config['TBill Rate']
+    spread = config['Spread']
+    tenor = config['Tenor']
+    roi = config['ROI']
+
+    # Filter customer-specific data
+    cust_vfin = vfin_df[vfin_df['Customer Name'] == customer].copy()
+    cust_buyfp = buyfp_df[buyfp_df['Customer Name'] == customer].copy()
+
+    # Add calculated fields to buyfp
+    cust_buyfp['TBill Rate'] = tbill
+    cust_buyfp['Spread'] = spread
+    cust_buyfp['Tenor'] = tenor
+    cust_buyfp['Rate'] = tbill + spread
+    cust_buyfp['Interest Amount'] = round(
+        cust_buyfp['BucoAmt'] * cust_buyfp['Rate'] * cust_buyfp['Tenor'] / 36500, 2
+    )
+
+    # Add calculated fields to vfin
+    cust_vfin['ROI'] = roi
+    principal_col = 'Amount' if 'Amount' in cust_vfin.columns else 'Principal'
+    if principal_col not in cust_vfin.columns:
+        raise Exception(f"Missing '{principal_col}' in vfin for {customer}")
+    cust_vfin['Interest Amount'] = round(
+        cust_vfin[principal_col] * roi * 1 / 36500, 2
+    )
+
+    # Create Master file
+    master_path = output_dir / f"{customer}_Master.xlsx"
+    with pd.ExcelWriter(master_path, engine='openpyxl') as writer:
+        cust_vfin.to_excel(writer, sheet_name='vfin', index=False)
+        cust_buyfp.to_excel(writer, sheet_name='buyfp', index=False)
+
+    # Process month-wise files
+    all_dates = pd.concat([cust_vfin['Date'], cust_buyfp['Date']]).dropna()
+    for period in all_dates.dt.to_period("M").unique():
+        start_date = period.to_timestamp()
+        end_date = start_date + pd.offsets.MonthEnd(0)
+
+        vfin_month = cust_vfin[(cust_vfin['Date'] >= start_date) & (cust_vfin['Date'] <= end_date)]
+        buyfp_month = cust_buyfp[(cust_buyfp['Date'] >= start_date) & (cust_buyfp['Date'] <= end_date)]
+
+        # Use format: CustomerName_Month.xlsx
+        month_name = period.strftime('%b')  # Jan, Feb, etc.
+        file_path = output_dir / f"{customer}_{month_name}.xlsx"
+
+        if not file_path.exists():
+            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                vfin_month.to_excel(writer, sheet_name='vfin', index=False)
+                buyfp_month.to_excel(writer, sheet_name='buyfp', index=False)
+        else:
+            wb = load_workbook(file_path)
+
+            # Append to vfin
+            if 'vfin' in wb.sheetnames:
+                vfin_sheet = wb['vfin']
+                vfin_sheet.append([])  # 1 blank row
+                for row in dataframe_to_rows(vfin_month, index=False, header=False):
+                    vfin_sheet.append(row)
+            else:
+                with pd.ExcelWriter(file_path, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
+                    vfin_month.to_excel(writer, sheet_name='vfin', index=False)
+
+            # Overwrite buyfp
+            if 'buyfp' in wb.sheetnames:
+                wb.remove(wb['buyfp'])
+            with pd.ExcelWriter(file_path, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
+                writer.book = wb
+                buyfp_month.to_excel(writer, sheet_name='buyfp', index=False)
+                writer.save()
+
+            wb.save(file_path)
+
+print("All customer master and monthly files created with proper naming and calculations.")

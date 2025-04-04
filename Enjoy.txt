@@ -1,0 +1,132 @@
+import pandas as pd
+from pathlib import Path
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import numbers
+
+# Helper to format Date column in Excel
+def format_date_column(sheet, column_name, date_format="DD-MMM-YY"):
+    header = [cell.value for cell in sheet[1]]
+    if column_name in header:
+        col_idx = header.index(column_name) + 1
+        for row in sheet.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+            for cell in row:
+                if isinstance(cell.value, pd.Timestamp):
+                    cell.number_format = date_format
+
+# Load Excel files
+vfin_df = pd.read_excel("Vfin.xlsx")
+buyfp_df = pd.read_excel("buyfp.xlsx")
+config_df = pd.read_excel("customer_config.xlsx")
+
+# Ensure Date columns are datetime
+vfin_df['Date'] = pd.to_datetime(vfin_df['Date'])
+buyfp_df['Date'] = pd.to_datetime(buyfp_df['Date'])
+
+# Root output folder
+root_output = Path("Customer_Excels")
+root_output.mkdir(exist_ok=True)
+
+# Process each customer
+for customer in buyfp_df['Customer Name'].dropna().unique():
+    config = config_df[config_df['Customer Name'] == customer]
+    if config.empty:
+        print(f"Skipping {customer} - no config found.")
+        continue
+
+    config = config.iloc[0]
+    tbill = config['TBill Rate']
+    spread = config['Spread']
+    tenor = config['Tenor']
+    roi = config['ROI']
+
+    # Filter customer data
+    cust_vfin = vfin_df[vfin_df['Customer Name'] == customer].copy()
+    cust_buyfp = buyfp_df[buyfp_df['Customer Name'] == customer].copy()
+
+    # Enrich buyfp
+    cust_buyfp['TBill Rate'] = tbill
+    cust_buyfp['Spread'] = spread
+    cust_buyfp['Tenor'] = tenor
+    cust_buyfp['Rate'] = tbill + spread
+    cust_buyfp['Interest Amount'] = round(
+        cust_buyfp['BucoAmt'] * cust_buyfp['Rate'] * cust_buyfp['Tenor'] / 36500, 2
+    )
+
+    # Enrich vfin
+    cust_vfin['ROI'] = roi
+    principal_col = 'Amount' if 'Amount' in cust_vfin.columns else 'Principal'
+    if principal_col not in cust_vfin.columns:
+        raise Exception(f"Missing '{principal_col}' column in vfin for {customer}")
+    cust_vfin['Interest Amount'] = round(
+        cust_vfin[principal_col] * roi * 1 / 36500, 2
+    )
+
+    # Create customer folder
+    customer_dir = root_output / customer
+    customer_dir.mkdir(exist_ok=True)
+
+    # Save Master file
+    master_path = customer_dir / f"{customer}_Master.xlsx"
+    with pd.ExcelWriter(master_path, engine='openpyxl') as writer:
+        cust_vfin.to_excel(writer, sheet_name='vfin', index=False)
+        cust_buyfp.to_excel(writer, sheet_name='buyfp', index=False)
+
+    # Format Master file dates
+    wb = load_workbook(master_path)
+    if 'vfin' in wb.sheetnames:
+        format_date_column(wb['vfin'], 'Date')
+    if 'buyfp' in wb.sheetnames:
+        format_date_column(wb['buyfp'], 'Date')
+    wb.save(master_path)
+
+    # Handle monthly files
+    all_dates = pd.concat([cust_vfin['Date'], cust_buyfp['Date']]).dropna()
+    for period in all_dates.dt.to_period("M").unique():
+        start_date = period.to_timestamp()
+        end_date = start_date + pd.offsets.MonthEnd(0)
+
+        vfin_month = cust_vfin[(cust_vfin['Date'] >= start_date) & (cust_vfin['Date'] <= end_date)]
+        buyfp_month = cust_buyfp[(cust_buyfp['Date'] >= start_date) & (cust_buyfp['Date'] <= end_date)]
+
+        year_str = start_date.strftime('%Y')
+        month_str = start_date.strftime('%b')
+        month_dir = customer_dir / year_str / month_str
+        month_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path = month_dir / f"{customer}_{month_str}.xlsx"
+
+        if not file_path.exists():
+            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                vfin_month.to_excel(writer, sheet_name='vfin', index=False)
+                buyfp_month.to_excel(writer, sheet_name='buyfp', index=False)
+        else:
+            wb = load_workbook(file_path)
+
+            # Append vfin
+            if 'vfin' in wb.sheetnames:
+                sheet = wb['vfin']
+                sheet.append([])
+                for row in dataframe_to_rows(vfin_month, index=False, header=False):
+                    sheet.append(row)
+            else:
+                with pd.ExcelWriter(file_path, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
+                    vfin_month.to_excel(writer, sheet_name='vfin', index=False)
+
+            # Overwrite buyfp
+            if 'buyfp' in wb.sheetnames:
+                wb.remove(wb['buyfp'])
+            with pd.ExcelWriter(file_path, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
+                writer.book = wb
+                buyfp_month.to_excel(writer, sheet_name='buyfp', index=False)
+                writer.save()
+
+        # Format date columns in monthly file
+        wb = load_workbook(file_path)
+        if 'vfin' in wb.sheetnames:
+            format_date_column(wb['vfin'], 'Date')
+        if 'buyfp' in wb.sheetnames:
+            format_date_column(wb['buyfp'], 'Date')
+        wb.save(file_path)
+
+print("All customer folders and files created with correct structure and date formatting.")

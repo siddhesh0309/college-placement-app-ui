@@ -1,0 +1,44 @@
+import pandas as pd
+from openpyxl import load_workbook
+
+# File paths
+template_file = "template.xlsx"
+template2_file = "template2.xlsx"
+output_file = "updated_template.xlsx"
+
+# Step 1: Read data from template (headers in row 4, data starts from row 9)
+df_template = pd.read_excel(template_file, header=3, skiprows=4)
+df_mapping = pd.read_excel(template2_file)
+
+# Ensure Account Number is string
+df_template['Account Number'] = df_template['Account Number'].astype(str)
+df_mapping['Account Number'] = df_mapping['Account Number'].astype(str)
+
+# Merge mapping fields
+df_template = df_template.merge(
+    df_mapping[['Account Number', 'Occupation', 'GHO Code', 'Status']],
+    on='Account Number',
+    how='left',
+    suffixes=('', '_mapped')
+)
+
+# Update or create only those 3 columns
+df_template['Occupation'] = df_template['Occupation_mapped']
+df_template['GHO Code'] = df_template['GHO Code_mapped']
+df_template['Status'] = df_template['Status_mapped']
+
+# Drop helper columns
+df_template.drop(columns=['Occupation_mapped', 'GHO Code_mapped', 'Status_mapped'], inplace=True)
+
+# Step 2: Load original template to preserve rows above row 9
+book = load_workbook(template_file)
+writer = pd.ExcelWriter(output_file, engine='openpyxl')
+writer.book = book
+writer.sheets = {ws.title: ws for ws in book.worksheets}
+
+# Step 3: Write updated data starting from row 9 (startrow=8), no headers
+df_template.to_excel(writer, index=False, header=False, startrow=8)
+
+# Save
+writer.save()
+writer.close()

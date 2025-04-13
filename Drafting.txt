@@ -1,0 +1,28 @@
+import pandas as pd
+
+# Load files
+customer_df = pd.read_excel("customer_data.xlsx")
+mapping_df = pd.read_excel("mapping_data.xlsx")
+
+# Ensure Account Number is string for matching
+customer_df['Account Number'] = customer_df['Account Number'].astype(str)
+mapping_df['Account Number'] = mapping_df['Account Number'].astype(str)
+
+# Prepare mapping lookup
+mapping_lookup = mapping_df.set_index('Account Number')[['Occupation', 'GHO Code', 'Account Status']]
+
+# Create empty columns first (to preserve order and ensure new only)
+customer_df['Occupation'] = ''
+customer_df['GHO Code'] = ''
+customer_df['Account Status'] = ''
+
+# Populate values without changing other columns
+for idx, row in customer_df.iterrows():
+    acc = row['Account Number']
+    if acc in mapping_lookup.index:
+        customer_df.at[idx, 'Occupation'] = mapping_lookup.at[acc, 'Occupation']
+        customer_df.at[idx, 'GHO Code'] = mapping_lookup.at[acc, 'GHO Code']
+        customer_df.at[idx, 'Account Status'] = mapping_lookup.at[acc, 'Account Status']
+
+# Overwrite the original file
+customer_df.to_excel("customer_data.xlsx", index=False)
